@@ -5,7 +5,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 
 **Họ tên / MSSV:** Đoàn Tuấn Long / 2A202602609
 **Repo:** https://github.com/tlong1610/K4-Track02-Day17-Data-Pipeline-Engineering
-**Commit bài nộp:** _<hash commit>_
+**Commit bài nộp:** `5998f60` (code + output; commit kế tiếp chỉ ghi hash này vào REPORT)
 **AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** Claude Code (Claude Opus 5.5): đọc code, đề xuất cách sửa 3 lỗi và bonus B1, soạn nháp REPORT và `bonus/DESIGN.md`. Tôi đã review từng dòng sửa và tự chạy lại toàn bộ kiểm tra; output bên dưới lấy từ lần chạy đó.
 **Nguồn tham khảo khác (nếu có):** slide Ngày 17; tài liệu Debezium (định dạng event), DuckDB `MERGE INTO`, dbt microbatch.
 
