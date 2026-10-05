@@ -11,13 +11,14 @@ expensive, slow and NOT deterministic, so the slide's four rules apply:
   3. estimate the cost BEFORE running (rows x tokens x price)
   4. LLM labels are versioned data (model + prompt_version stored on every row)
 
-The shipped `label_tickets` is the NAIVE version: it calls the model for every
-ticket on every run and writes whatever comes back. Your bonus task is to make
-`python -m scripts.bonus_llm` print BONUS PASS. Zero-key: `FakeLLM` stands in for a
+The shipped `label_tickets` was the NAIVE version (a call per ticket per run,
+whatever came back went to Gold); it now follows the four rules above, and
+`python -m scripts.bonus_llm` prints BONUS PASS. Zero-key: `FakeLLM` stands in for a
 real model (swap in any provider via .env if you like — the pipeline is the same).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -80,14 +81,60 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
     """).fetchall()
 
 
+def input_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
-    for ticket_id, text in live_tickets(con):
-        raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
+    """Cached, validated LLM labelling: an LLM call is a transform like any other.
+
+    Cache key = hash(prompt) + model + prompt version (read at call time, so a new
+    PROMPT_VERSION re-labels everything on purpose). The RAW answer is cached, valid
+    or not, so a re-run makes 0 calls. Valid labels -> gold_ticket_labels,
+    off-schema answers -> llm_label_quarantine, never Gold.
+    """
+    model, prompt_version = llm.model, PROMPT_VERSION
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        input_hash VARCHAR, model VARCHAR, prompt_version VARCHAR, raw_answer VARCHAR)""")
+
+    prompts = [(ticket_id, PROMPT_TEMPLATE.format(text=text))
+               for ticket_id, text in live_tickets(con)]
+    cached = dict(con.execute(
+        "SELECT input_hash, raw_answer FROM llm_label_cache WHERE model = ? AND prompt_version = ?",
+        [model, prompt_version]).fetchall())
+    misses = {input_hash(p): p for _, p in prompts if input_hash(p) not in cached}
+
+    # Estimate the cost BEFORE calling the model (only cache misses cost money).
+    est_tokens = sum(len(p.split()) + 8 for p in misses.values())
+    est_cost = est_tokens / 1000 * PRICE_PER_1K_TOKENS_USD
+
+    calls_before = llm.calls
+    new_rows = []
+    for h, prompt in misses.items():
+        raw = llm.complete(prompt)
+        cached[h] = raw
+        new_rows.append((h, model, prompt_version, raw))
+    if new_rows:
+        con.executemany("INSERT INTO llm_label_cache VALUES (?, ?, ?, ?)", new_rows)
+
+    good, bad = [], []
+    for ticket_id, prompt in prompts:
+        raw = cached[input_hash(prompt)]
+        label = parse_label(raw)
+        if label is None:
+            bad.append((ticket_id, raw, model, prompt_version, "off-schema answer"))
+        else:
+            good.append((ticket_id, label, model, prompt_version))
+
     con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
         ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
-    if rows:
-        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+    con.execute("""CREATE OR REPLACE TABLE llm_label_quarantine (
+        ticket_id VARCHAR, raw_answer VARCHAR, model VARCHAR, prompt_version VARCHAR,
+        reason VARCHAR)""")
+    if good:
+        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", good)
+    if bad:
+        con.executemany("INSERT INTO llm_label_quarantine VALUES (?, ?, ?, ?, ?)", bad)
+    return {"labeled": len(good), "quarantined": len(bad),
+            "calls": llm.calls - calls_before, "cache_hits": len(prompts) - len(misses),
+            "est_tokens": est_tokens, "est_cost_usd": round(est_cost, 6)}
