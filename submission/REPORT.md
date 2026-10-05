@@ -4,37 +4,38 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 Định dạng tham chiếu và phạm vi tính trang: [SUBMISSION.md](../docs/SUBMISSION.md).
 
 **Họ tên / MSSV:** Đoàn Tuấn Long / 2A202602609
-**Repo:** https://github.com/tlong1610/K4-Track02-Day17-Data-Pipeline-Engineering
-**Commit bài nộp:** `5998f60` (code + output; commit kế tiếp chỉ ghi hash này vào REPORT)
+**Repo:** https://github.com/tlong1610/K4-Track02-Day17-DoanTuanLong-2A202602609-DataPipelineEngineering
+**Commit bài nộp:** HEAD của `main`. Code và output tại `5998f60`; các commit sau chỉ sửa REPORT.
 **AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** Claude Code (Claude Opus 5.5): đọc code, đề xuất cách sửa 3 lỗi và bonus B1, soạn nháp REPORT và `bonus/DESIGN.md`. Tôi đã review từng dòng sửa và tự chạy lại toàn bộ kiểm tra; output bên dưới lấy từ lần chạy đó.
-**Nguồn tham khảo khác (nếu có):** slide Ngày 17; tài liệu Debezium (định dạng event), DuckDB `MERGE INTO`, dbt microbatch.
+**Nguồn tham khảo khác (nếu có):** slide Ngày 17; tài liệu Debezium, DuckDB `MERGE INTO`, dbt microbatch.
 
 ## 1. Ba lỗi
 
 | | Lỗi Silver | Lỗi late data | Lỗi xoá (CDC) |
 |---|---|---|---|
-| **Triệu chứng** | verify: `24 rows for 12 tickets`; T-91 có 3 hàng (`low/open`, `high/open`, `high/closed/bug`); `gold_doc_chunks` 22 hàng / 9 chunk; rerun3 FAIL (`gold_doc_chunks` đổi checksum sau mỗi lần chạy lại) | verify: `gold_feature_daily` ≠ full recompute (`c50b8851affe != 8630e04a61d1`); u05 ngày 08-12 = `(2, 0)` thay vì `(5, 1)`; `LOOKBACK_DAYS=0 < 3` | T-97 vẫn `is_deleted = False`, còn `user_id`, tên, nội dung; còn 1 hàng trong snapshot `v2026-08-16` và 2 chunk trong RAG index |
-| **Nguyên nhân gốc** | `upsert_silver_tickets` dùng `INSERT` mỗi batch: không có khoá, không so LSN, nên chạy lại batch cũ chèn thêm một hàng trạng thái cũ | `LOOKBACK_DAYS = 0` dựa trên giả định "event tới trong vài giây". Thực tế event offline của u05 tới trễ 3 ngày, nên run 08-15 không tính lại partition 08-12 | `staging.py` lấy `ticket_id` chỉ từ `after`. Với `op='d'` thì `after = null`, nên `ticket_id` NULL và bị lọc ở `WHERE ticket_id IS NOT NULL`: bản ghi xoá biến mất trước khi tới Silver |
-| **Cách sửa** | `pipeline/silver.py`: `MERGE INTO silver_tickets ON ticket_id`, `WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE` toàn bộ cột, `WHEN NOT MATCHED THEN INSERT` | `pipeline/config.py`: `LOOKBACK_DAYS = 3` = ceil(P99 = 3.00) đo bằng `main.py --lateness`; mỗi run overwrite-partition `[day-3, day]` | `pipeline/staging.py`: `ticket_id = coalesce(after.ticket_id, before.ticket_id, key.ticket_id)`. Các cột khác vẫn lấy từ `after` (NULL), nên MERGE ghi đè hàng thành tombstone |
-| **Khái niệm trên slide** | Silver có khoá, MERGE theo khoá, "bản mới hơn thắng" bằng LSN guard, idempotent | Data về muộn: event time, lookback = ceil(P99) đo từ Bronze | CDC log-based (`before`/`after`/`op`), tombstone, "xoá phải lan" xuống Gold |
+| **Triệu chứng** | `24 rows for 12 tickets`; T-91 có 3 hàng; rerun3 FAIL | Gold ≠ full recompute; u05 ngày 08-12 = `(2, 0)` thay vì `(5, 1)` | T-97 `is_deleted = False`, còn PII; còn trong snapshot `v08-16` và 2 chunk RAG |
+| **Nguyên nhân gốc** | `INSERT` mỗi batch: không khoá, không so LSN | `LOOKBACK_DAYS = 0` là đoán, không đo; event trễ 3 ngày không được tính lại | `ticket_id` chỉ lấy từ `after`, mà delete có `after = null`, nên bản ghi xoá bị lọc mất |
+| **Cách sửa** | `silver.py`: `MERGE ON ticket_id`, chỉ `UPDATE` khi `s._lsn > t._lsn` | `config.py`: `LOOKBACK_DAYS = 3` | `staging.py`: `coalesce(after, before, key).ticket_id`; MERGE ghi đè thành tombstone |
+| **Khái niệm** | Silver có khoá, MERGE, LSN guard | Late data, lookback = ceil(P99) | CDC log-based, tombstone, "xoá phải lan" |
 
 ## 2. Các con số
 
-- P99 lateness đo từ Bronze: `3.00` ngày (p50 = 0, p95 = 2.90, max = 3, 43 record) → `LOOKBACK_DAYS = 3`
+- P99 lateness đo từ Bronze: `3.00` ngày → `LOOKBACK_DAYS = 3`
 - `submission/checksums.txt`: **PASS**. Gold checksum: `39e115c510ecdf526800eac227158a4f`
-- `make parity`: **PARITY** (`silver_tickets` 3c15dfd43701, `gold_feature_daily` 8630e04a61d1)
+- `make parity`: **PARITY**
 
-## 3. Lựa chọn công cụ / kỹ thuật (mỗi dòng một câu "vì sao")
+## 3. Lựa chọn công cụ / kỹ thuật
 
-- **MERGE theo khoá cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`:** ticket là thực thể thay đổi trạng thái nên cần upsert theo khoá kèm LSN guard để batch cũ không đè batch mới. Feature theo ngày là aggregate, tính lại cả partition `[day-3, day]` từ Silver vừa đơn giản vừa tự sửa được dữ liệu đến muộn.
-- **Tombstone thay vì xoá hẳn hàng trong Silver:** tombstone là một trạng thái có LSN, nên khi chạy lại batch cũ chứa `op='c'` của T-97, MERGE thấy LSN cũ hơn và không "hồi sinh" ticket. Xoá hẳn sẽ để batch cũ chèn lại hàng. Đổi lại, hàng tombstone (chỉ còn khoá và LSN, không còn PII) tồn tại mãi.
-- **Snapshot training dựng lại từ Bronze "as of" ngày đó, không sửa snapshot cũ:** mô hình đã train trên `v2026-08-14` phải tái lập được. Feedback đến muộn tạo `v2026-08-15` mới thay vì sửa lịch sử (point-in-time, chống rò rỉ tương lai).
-- **DuckDB (lite) / dbt (track dbt) thay vì Spark:** dữ liệu cỡ KB–GB chạy trên một máy trong vài giây, không cần cluster. dbt cho `merge`/`microbatch`, contract và unit test mà vẫn chạy trên DuckDB. Spark chỉ đáng dùng khi dữ liệu vượt RAM một máy.
+- **MERGE cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`:** ticket là thực thể đổi trạng thái, cần upsert theo khoá kèm LSN guard để batch cũ không đè batch mới; feature theo ngày là aggregate, tính lại cả partition `[day-3, day]` sẽ tự sửa dữ liệu đến muộn.
+- **Tombstone thay vì xoá hẳn:** tombstone giữ LSN của lần xoá, nên chạy lại batch cũ không "hồi sinh" T-97. Cái giá là hàng tombstone (không còn PII) tồn tại mãi.
+- **Lookback = 3:** đúng bằng ceil(P99) đo từ Bronze; nhỏ hơn thì mất event muộn, lớn hơn thì tốn công tính lại.
+- **Snapshot dựng lại "as of", không sửa:** model đã train trên `v08-14` phải tái lập được; feedback muộn tạo `v08-15` mới.
+- **DuckDB/dbt thay vì Spark:** dữ liệu cỡ KB–GB chạy vài giây trên một máy; Spark chỉ đáng dùng khi vượt RAM một máy.
 
 ## 4. Hai câu hỏi suy ngẫm
 
-1. **Snapshot bất biến và quyền được xoá:** bất biến là cam kết kỹ thuật, còn quyền xoá là nghĩa vụ pháp lý, nên quyền xoá thắng. Cách xử lý: (a) đánh dấu các snapshot `v08-12..v08-14` là *revoked* và tạo version mới không có T-97 bằng cách dựng lại từ Bronze có áp dụng danh sách xoá; mô hình train trên snapshot cũ được lên lịch train lại. (b) Lâu dài thì dùng crypto-shredding: văn bản trong Bronze/snapshot được mã hoá bằng khoá của từng khách, huỷ khoá là xoá được mà không phải ghi lại file bất biến. Kèm theo retention (ví dụ 90 ngày) cho snapshot cũ.
-2. **Chốt PII cho tên người:** đặt ở cửa Bronze→Silver (cùng chỗ `mask_pii`), vì đây là điểm duy nhất mọi dữ liệu đi qua trước khi tới Gold, RAG hay LLM. Dùng regex cộng mô hình NER tiếng Việt (PER/LOC) và thay bằng `<NAME>`. Đo bằng recall và precision trên một tập vài trăm câu gán nhãn tay (có/không dấu), mục tiêu recall ≥ 0.95. Thêm một contract kiểu `verify` quét Gold bằng NER và cảnh báo khi số lần phát hiện > 0.
+1. Quyền xoá là nghĩa vụ pháp lý nên thắng. Tôi đánh dấu snapshot `v08-12..v08-14` là revoked, dựng version mới không có T-97 và train lại model dùng chúng. Lâu dài: mã hoá văn bản theo khoá từng khách (crypto-shredding), huỷ khoá là xoá mà không phải ghi lại file bất biến; kèm retention cho snapshot cũ.
+2. Đặt chốt ở Bronze→Silver, cạnh `mask_pii`, vì mọi dữ liệu đi qua đó trước khi tới Gold, RAG hay LLM. Dùng thêm NER tiếng Việt để thay tên bằng `<NAME>`. Đo recall trên vài trăm câu gán nhãn tay (có/không dấu), mục tiêu ≥ 0.95, và thêm contract quét Gold bằng NER.
 
 ## Phụ lục (ngoài giới hạn 1 trang) — Extensions: câu hỏi suy ngẫm
 
